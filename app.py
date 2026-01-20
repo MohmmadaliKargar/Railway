@@ -55,6 +55,8 @@ def inbound_sms():
         resp.message("Welcome back! You’re subscribed again. Reply STOP to opt out.")
     elif body == "help":
         resp.message("Reply JOIN to subscribe. Reply STOP to opt out.")
+    elif body == "salam":
+        resp.message("ASAK to you!.")
     else:
         resp.message("Reply JOIN to subscribe. Reply HELP for options.")
 
@@ -62,3 +64,4 @@ def inbound_sms():
 
 # Create table on startup
 init_db()
+
