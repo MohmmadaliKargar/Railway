@@ -251,7 +251,7 @@ def inbound_sms():
         resp.message(
             "✅ You’re subscribed.\n\n"
             "Provide your email to also subscribe to our FREE electronic reminder list to receive important "
-            "updates, including moon-sighting announcements."
+            "updates, including moon-sighting announcements. "
             "If you prefer SMS only, reply SKIP.\n\n"
             "Reply STOP to opt out."
         )
