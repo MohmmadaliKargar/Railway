@@ -1,6 +1,6 @@
 import os
 import re
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 
 from flask import Flask, request
 from twilio.twiml.messaging_response import MessagingResponse
@@ -28,6 +28,12 @@ twilio_client = Client(
 
 
 # ----------------------------
+# SETTINGS
+# ----------------------------
+EMAIL_WAIT_HOURS = 24
+
+
+# ----------------------------
 # DATABASE HELPERS
 # ----------------------------
 def get_conn():
@@ -38,7 +44,7 @@ def init_db():
     with get_conn() as conn:
         with conn.cursor() as cur:
 
-            # Create subscribers table if it doesn't exist
+            # Create table if it does not already exist
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS subscribers (
                     phone_e164 TEXT PRIMARY KEY,
@@ -48,17 +54,23 @@ def init_db():
                 )
             """)
 
-            # Add email column without deleting existing subscribers
+            # Add email column without removing existing subscribers
             cur.execute("""
                 ALTER TABLE subscribers
                 ADD COLUMN IF NOT EXISTS email TEXT
             """)
 
-            # Tracks whether we are waiting for this person's email
+            # Track whether we're currently waiting for an email
             cur.execute("""
                 ALTER TABLE subscribers
                 ADD COLUMN IF NOT EXISTS awaiting_email BOOLEAN
                 NOT NULL DEFAULT FALSE
+            """)
+
+            # Track when the email request began
+            cur.execute("""
+                ALTER TABLE subscribers
+                ADD COLUMN IF NOT EXISTS awaiting_email_since TIMESTAMPTZ
             """)
 
         conn.commit()
@@ -69,6 +81,8 @@ def upsert_subscriber(
     opted_in: bool,
     source: str = "sms_keyword"
 ):
+    now = datetime.now(timezone.utc)
+
     with get_conn() as conn:
         with conn.cursor() as cur:
 
@@ -90,7 +104,7 @@ def upsert_subscriber(
                 phone_e164,
                 opted_in,
                 source,
-                datetime.utcnow()
+                now
             ))
 
         conn.commit()
@@ -100,19 +114,37 @@ def set_awaiting_email(
     phone_e164: str,
     awaiting: bool
 ):
+    now = datetime.now(timezone.utc)
+
     with get_conn() as conn:
         with conn.cursor() as cur:
 
-            cur.execute("""
-                UPDATE subscribers
-                SET awaiting_email = %s,
-                    updated_at = %s
-                WHERE phone_e164 = %s
-            """, (
-                awaiting,
-                datetime.utcnow(),
-                phone_e164
-            ))
+            if awaiting:
+
+                cur.execute("""
+                    UPDATE subscribers
+                    SET awaiting_email = TRUE,
+                        awaiting_email_since = %s,
+                        updated_at = %s
+                    WHERE phone_e164 = %s
+                """, (
+                    now,
+                    now,
+                    phone_e164
+                ))
+
+            else:
+
+                cur.execute("""
+                    UPDATE subscribers
+                    SET awaiting_email = FALSE,
+                        awaiting_email_since = NULL,
+                        updated_at = %s
+                    WHERE phone_e164 = %s
+                """, (
+                    now,
+                    phone_e164
+                ))
 
         conn.commit()
 
@@ -122,20 +154,50 @@ def is_awaiting_email(phone_e164: str) -> bool:
         with conn.cursor() as cur:
 
             cur.execute("""
-                SELECT awaiting_email
+                SELECT
+                    awaiting_email,
+                    awaiting_email_since
                 FROM subscribers
                 WHERE phone_e164 = %s
-            """, (phone_e164,))
+            """, (
+                phone_e164,
+            ))
 
             row = cur.fetchone()
 
-    return bool(row and row[0])
+    if not row:
+        return False
+
+    awaiting_email, awaiting_since = row
+
+    if not awaiting_email or not awaiting_since:
+        return False
+
+    expires_at = (
+        awaiting_since
+        + timedelta(hours=EMAIL_WAIT_HOURS)
+    )
+
+    # If more than 24 hours have passed,
+    # clear the awaiting-email state
+    if datetime.now(timezone.utc) > expires_at:
+
+        set_awaiting_email(
+            phone_e164,
+            False
+        )
+
+        return False
+
+    return True
 
 
 def save_email(
     phone_e164: str,
     email: str
 ):
+    now = datetime.now(timezone.utc)
+
     with get_conn() as conn:
         with conn.cursor() as cur:
 
@@ -143,11 +205,12 @@ def save_email(
                 UPDATE subscribers
                 SET email = %s,
                     awaiting_email = FALSE,
+                    awaiting_email_since = NULL,
                     updated_at = %s
                 WHERE phone_e164 = %s
             """, (
                 email.lower(),
-                datetime.utcnow(),
+                now,
                 phone_e164
             ))
 
@@ -160,14 +223,20 @@ def save_email(
 def validate_email(value: str):
     """
     Returns:
-        (True, None) if email looks valid
-        (False, suggestion) if a common typo is detected
-        (False, None) if format is invalid
+
+    (True, None)
+        Valid-looking email
+
+    (False, suggestion)
+        Common typo detected
+
+    (False, None)
+        Invalid email format
     """
 
     value = value.strip().lower()
 
-    # Basic email format validation
+    # Basic email-format validation
     if not re.fullmatch(
         r"[^@\s]+@[^@\s]+\.[A-Za-z]{2,}",
         value
@@ -176,8 +245,9 @@ def validate_email(value: str):
 
     username, domain = value.rsplit("@", 1)
 
-    # Common email-provider typos
+    # Common email provider typos
     typo_domains = {
+
         # Yahoo
         "yahoo.cm": "yahoo.com",
         "yahoo.con": "yahoo.com",
@@ -204,9 +274,11 @@ def validate_email(value: str):
         # iCloud
         "icloud.cm": "icloud.com",
         "icloud.con": "icloud.com",
+        "icloud.cmo": "icloud.com",
     }
 
     if domain in typo_domains:
+
         suggested_email = (
             f"{username}@{typo_domains[domain]}"
         )
@@ -236,24 +308,25 @@ def inbound_sms():
     # ------------------------
     if body_lower == "join":
 
-        # Subscribe immediately
+        # Subscribe them immediately
         upsert_subscriber(
             from_number,
             True
         )
 
-        # Wait for optional email
+        # Start the 24-hour email collection window
         set_awaiting_email(
             from_number,
             True
         )
 
         resp.message(
-            "✅ You’re subscribed.\n\n"
-            "Provide your email to also subscribe to our FREE electronic reminder list to receive important "
-            "updates, including moon-sighting announcements. "
-            "If you prefer SMS only, reply SKIP.\n\n"
-            "Reply STOP to opt out."
+            "✅ Congratulations! You’re subscribed to Misbah’s "
+            "text message list.\n\n"
+            "If you’d also like to join Misbah’s FREE email reminder list, "
+            "reply with your email address to receive important updates, "
+            "including moon-sighting announcements.\n\n"
+            "You can reply STOP to opt out at any time."
         )
 
 
@@ -355,13 +428,12 @@ def inbound_sms():
                 "has been saved."
             )
 
-        # Likely typo
+        # Common typo detected
         elif suggestion:
 
             resp.message(
                 f"Did you mean {suggestion}?\n\n"
-                "Please send your email address again, "
-                "or reply SKIP."
+                "Please send your email address again."
             )
 
         # Invalid format
@@ -370,8 +442,7 @@ def inbound_sms():
             resp.message(
                 "That doesn’t appear to be a valid "
                 "email address.\n\n"
-                "Please check it and send it again, "
-                "or reply SKIP."
+                "Please check it and send it again."
             )
 
 
@@ -395,7 +466,7 @@ def inbound_sms():
 
         except Exception as exc:
 
-            # Don't break webhook if alert fails
+            # Don't break the webhook if admin alert fails
             print(
                 f"[ERROR] Failed to alert admin: {exc}"
             )
