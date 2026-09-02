@@ -1,29 +1,34 @@
 import os
 import re
 from datetime import datetime
+
 from flask import Flask, request
 from twilio.twiml.messaging_response import MessagingResponse
 from twilio.rest import Client
 import psycopg2
 
+
 app = Flask(__name__)
+
 
 # ----------------------------
 # ENV VARS
 # ----------------------------
 DATABASE_URL = os.environ["DATABASE_URL"]
 
-# Needed to send you alert SMS
 TWILIO_ACCOUNT_SID = os.environ["TWILIO_ACCOUNT_SID"]
 TWILIO_AUTH_TOKEN = os.environ["TWILIO_AUTH_TOKEN"]
 TWILIO_FROM_NUMBER = os.environ["TWILIO_FROM_NUMBER"]
 ADMIN_PHONE = os.environ["ADMIN_PHONE"]
 
-twilio_client = Client(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
+twilio_client = Client(
+    TWILIO_ACCOUNT_SID,
+    TWILIO_AUTH_TOKEN
+)
 
 
 # ----------------------------
-# DB HELPERS
+# DATABASE HELPERS
 # ----------------------------
 def get_conn():
     return psycopg2.connect(DATABASE_URL)
@@ -33,7 +38,7 @@ def init_db():
     with get_conn() as conn:
         with conn.cursor() as cur:
 
-            # Create the table if this is a brand-new database.
+            # Create subscribers table if it doesn't exist
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS subscribers (
                     phone_e164 TEXT PRIMARY KEY,
@@ -43,13 +48,13 @@ def init_db():
                 )
             """)
 
-            # Add email support to an EXISTING table.
-            # These commands do NOT delete existing subscribers.
+            # Add email column without deleting existing subscribers
             cur.execute("""
                 ALTER TABLE subscribers
                 ADD COLUMN IF NOT EXISTS email TEXT
             """)
 
+            # Tracks whether we are waiting for this person's email
             cur.execute("""
                 ALTER TABLE subscribers
                 ADD COLUMN IF NOT EXISTS awaiting_email BOOLEAN
@@ -66,6 +71,7 @@ def upsert_subscriber(
 ):
     with get_conn() as conn:
         with conn.cursor() as cur:
+
             cur.execute("""
                 INSERT INTO subscribers (
                     phone_e164,
@@ -75,7 +81,8 @@ def upsert_subscriber(
                 )
                 VALUES (%s, %s, %s, %s)
 
-                ON CONFLICT (phone_e164) DO UPDATE SET
+                ON CONFLICT (phone_e164)
+                DO UPDATE SET
                     opted_in = EXCLUDED.opted_in,
                     source = EXCLUDED.source,
                     updated_at = EXCLUDED.updated_at
@@ -89,9 +96,13 @@ def upsert_subscriber(
         conn.commit()
 
 
-def set_awaiting_email(phone_e164: str, awaiting: bool):
+def set_awaiting_email(
+    phone_e164: str,
+    awaiting: bool
+):
     with get_conn() as conn:
         with conn.cursor() as cur:
+
             cur.execute("""
                 UPDATE subscribers
                 SET awaiting_email = %s,
@@ -109,6 +120,7 @@ def set_awaiting_email(phone_e164: str, awaiting: bool):
 def is_awaiting_email(phone_e164: str) -> bool:
     with get_conn() as conn:
         with conn.cursor() as cur:
+
             cur.execute("""
                 SELECT awaiting_email
                 FROM subscribers
@@ -120,9 +132,13 @@ def is_awaiting_email(phone_e164: str) -> bool:
     return bool(row and row[0])
 
 
-def save_email(phone_e164: str, email: str):
+def save_email(
+    phone_e164: str,
+    email: str
+):
     with get_conn() as conn:
         with conn.cursor() as cur:
+
             cur.execute("""
                 UPDATE subscribers
                 SET email = %s,
@@ -130,7 +146,7 @@ def save_email(phone_e164: str, email: str):
                     updated_at = %s
                 WHERE phone_e164 = %s
             """, (
-                email,
+                email.lower(),
                 datetime.utcnow(),
                 phone_e164
             ))
@@ -138,14 +154,66 @@ def save_email(phone_e164: str, email: str):
         conn.commit()
 
 
-def is_valid_email(value: str) -> bool:
-    # Simple practical email validation
-    return bool(
-        re.fullmatch(
-            r"[^@\s]+@[^@\s]+\.[^@\s]+",
-            value
+# ----------------------------
+# EMAIL VALIDATION
+# ----------------------------
+def validate_email(value: str):
+    """
+    Returns:
+        (True, None) if email looks valid
+        (False, suggestion) if a common typo is detected
+        (False, None) if format is invalid
+    """
+
+    value = value.strip().lower()
+
+    # Basic email format validation
+    if not re.fullmatch(
+        r"[^@\s]+@[^@\s]+\.[A-Za-z]{2,}",
+        value
+    ):
+        return False, None
+
+    username, domain = value.rsplit("@", 1)
+
+    # Common email-provider typos
+    typo_domains = {
+        # Yahoo
+        "yahoo.cm": "yahoo.com",
+        "yahoo.con": "yahoo.com",
+        "yahoo.cmo": "yahoo.com",
+        "yaho.com": "yahoo.com",
+
+        # Gmail
+        "gmail.cm": "gmail.com",
+        "gmail.con": "gmail.com",
+        "gmail.cmo": "gmail.com",
+        "gamil.com": "gmail.com",
+        "gmial.com": "gmail.com",
+
+        # Hotmail
+        "hotmail.cm": "hotmail.com",
+        "hotmail.con": "hotmail.com",
+        "hotmail.cmo": "hotmail.com",
+
+        # Outlook
+        "outlook.cm": "outlook.com",
+        "outlook.con": "outlook.com",
+        "outlook.cmo": "outlook.com",
+
+        # iCloud
+        "icloud.cm": "icloud.com",
+        "icloud.con": "icloud.com",
+    }
+
+    if domain in typo_domains:
+        suggested_email = (
+            f"{username}@{typo_domains[domain]}"
         )
-    )
+
+        return False, suggested_email
+
+    return True, None
 
 
 # ----------------------------
@@ -162,22 +230,31 @@ def inbound_sms():
 
     resp = MessagingResponse()
 
+
     # ------------------------
     # JOIN
     # ------------------------
     if body_lower == "join":
 
-        # Subscribe immediately.
-        # Email is OPTIONAL.
-        upsert_subscriber(from_number, True)
+        # Subscribe immediately
+        upsert_subscriber(
+            from_number,
+            True
+        )
 
-        # The next message can be treated as an email address.
-        set_awaiting_email(from_number, True)
+        # Wait for optional email
+        set_awaiting_email(
+            from_number,
+            True
+        )
 
         resp.message(
-            "✅ You’re subscribed. Please provide your email address. "
+            "✅ You’re subscribed.\n\n"
+            "Please provide your email address, "
+            "or reply SKIP if you prefer SMS reminders only.\n\n"
             "Reply STOP to opt out."
         )
+
 
     # ------------------------
     # STOP
@@ -190,24 +267,42 @@ def inbound_sms():
         "quit"
     ):
 
-        upsert_subscriber(from_number, False)
-        set_awaiting_email(from_number, False)
+        upsert_subscriber(
+            from_number,
+            False
+        )
+
+        set_awaiting_email(
+            from_number,
+            False
+        )
 
         resp.message(
-            "You’re unsubscribed. Reply START to re-subscribe."
+            "You’re unsubscribed. "
+            "Reply START to re-subscribe."
         )
+
 
     # ------------------------
     # START
     # ------------------------
     elif body_lower == "start":
 
-        upsert_subscriber(from_number, True)
+        upsert_subscriber(
+            from_number,
+            True
+        )
+
+        set_awaiting_email(
+            from_number,
+            False
+        )
 
         resp.message(
             "Welcome back! You’re subscribed again. "
             "Reply STOP to opt out."
         )
+
 
     # ------------------------
     # HELP
@@ -215,39 +310,78 @@ def inbound_sms():
     elif body_lower == "help":
 
         resp.message(
-            "Reply JOIN to subscribe. Reply STOP to opt out."
+            "Reply JOIN to subscribe. "
+            "Reply STOP to opt out."
         )
+
+
+    # ------------------------
+    # SKIP EMAIL
+    # ------------------------
+    elif (
+        body_lower == "skip"
+        and is_awaiting_email(from_number)
+    ):
+
+        set_awaiting_email(
+            from_number,
+            False
+        )
+
+        resp.message(
+            "No problem. You’ll remain subscribed "
+            "to SMS reminders."
+        )
+
 
     # ------------------------
     # EMAIL RESPONSE
     # ------------------------
     elif is_awaiting_email(from_number):
 
-        if is_valid_email(body):
+        valid, suggestion = validate_email(body)
 
-            save_email(from_number, body)
+        # Valid email
+        if valid:
 
-            resp.message(
-                "Thank you! Your email address has been saved."
+            save_email(
+                from_number,
+                body
             )
 
+            resp.message(
+                "Thank you! Your email address "
+                "has been saved."
+            )
+
+        # Likely typo
+        elif suggestion:
+
+            resp.message(
+                f"Did you mean {suggestion}?\n\n"
+                "Please send your email address again, "
+                "or reply SKIP."
+            )
+
+        # Invalid format
         else:
 
-            # They are already subscribed.
-            # We simply tell them that the email is optional.
             resp.message(
-                "That doesn’t appear to be a valid email address. "
-                "Please reply with your email address, or ignore this "
-                "message if you prefer SMS reminders only."
+                "That doesn’t appear to be a valid "
+                "email address.\n\n"
+                "Please check it and send it again, "
+                "or reply SKIP."
             )
+
 
     # ------------------------
     # OTHER MESSAGES
     # ------------------------
     else:
 
-        # Alert YOU with the incoming message
+        # Alert admin with incoming message
         try:
+
             twilio_client.messages.create(
                 from_=TWILIO_FROM_NUMBER,
                 to=ADMIN_PHONE,
@@ -259,18 +393,26 @@ def inbound_sms():
             )
 
         except Exception as exc:
-            # Don't break the webhook if alert fails
-            print(f"[ERROR] Failed to alert admin: {exc}")
 
-        # Reply to the sender
+            # Don't break webhook if alert fails
+            print(
+                f"[ERROR] Failed to alert admin: {exc}"
+            )
+
+
+        # Reply to sender
         resp.message(
             "Your message has been received. "
             "We will get back to you shortly.\n\n"
-            "Reply JOIN to subscribe. Reply HELP for options."
+            "Reply JOIN to subscribe. "
+            "Reply HELP for options."
         )
+
 
     return str(resp)
 
 
-# Create/update table on startup
+# ----------------------------
+# INITIALIZE DATABASE
+# ----------------------------
 init_db()
