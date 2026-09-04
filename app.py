@@ -321,12 +321,10 @@ def inbound_sms():
         )
 
         resp.message(
-            "✅ Congratulations! You’re subscribed to Misbah’s "
-            "text message list.\n\n"
-            "If you’d also like to join Misbah’s FREE email reminder list, "
-            "reply with your email address to receive important updates, "
-            "including moon-sighting announcements.\n\n"
-            "You can reply STOP to opt out at any time."
+        "✅ You’re all set!\n\n"
+        "Want to never miss a Misbah reminder? 📩 "
+        "Reply with your email to join our FREE email list.\n\n"
+        "Reply STOP to opt out."
         )
 
 
