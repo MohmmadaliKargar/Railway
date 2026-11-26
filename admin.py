@@ -306,7 +306,7 @@ header{display:flex;flex-wrap:wrap;align-items:center;justify-content:space-betw
 gap:8px;margin-bottom:8px}header h1{margin:8px 0}
 .account{display:flex;align-items:center;gap:10px;margin:0}
 .account button{margin-top:0;padding:6px 12px}
-input[type=email],input[type=password]{width:100%;font:inherit;color:inherit;
+input[type=text],input[type=password]{width:100%;font:inherit;color:inherit;
 background:var(--bg);border:1px solid var(--line);border-radius:8px;padding:10px}
 """
 
@@ -390,7 +390,8 @@ def login_page(error="", next_url="/admin"):
           <form method="post" action="/admin/login">
             <input type="hidden" name="next" value="{escape(next_url)}">
             <label>Username
-              <input type="email" name="username" autocomplete="username" required autofocus></label>
+              <input type="text" name="username" autocomplete="username" autocapitalize="none"
+                     autocorrect="off" spellcheck="false" required autofocus></label>
             <label>Password
               <input type="password" name="password" autocomplete="current-password" required></label>
             <button type="submit">Sign in</button>
