@@ -292,7 +292,7 @@ padding:10px 16px;background:var(--accent);color:var(--accent-text);cursor:point
 text-decoration:none;margin-top:8px}
 button.secondary,.button.secondary{background:transparent;color:var(--text);
 border:1px solid var(--line)}
-button.danger{background:var(--warn);color:var(--card)}
+button.danger,.button.danger{background:var(--warn);color:var(--card)}
 pre.msg{white-space:pre-wrap;word-wrap:break-word;background:var(--bg);
 border:1px solid var(--line);border-radius:8px;padding:12px;font:inherit;margin:0 0 12px}
 .muted{color:var(--muted)}.note{background:var(--warn-bg);color:var(--warn);
@@ -337,8 +337,8 @@ def page(title, content, refresh=False):
 
 
 def discard_form(draft_id):
-    return (f"<form method='post' action='/admin/draft/{draft_id}/discard' style='display:inline'"
-            f" onsubmit=\"return confirm('Cancel this message? Nothing will be sent.')\">"
+    # No pop-up: nothing has been sent yet, so cancelling a draft is harmless.
+    return (f"<form method='post' action='/admin/draft/{draft_id}/discard' style='display:inline'>"
             f"<button class='secondary' type='submit'>Cancel, don't send</button></form>")
 
 
@@ -555,8 +555,11 @@ def register_admin(app):
         body, status = row
         if status != "draft":
             return redirect(f"/admin/send/{draft_id}", 303)
-        default_at = (datetime.now(ET) + timedelta(hours=1)).replace(
-            minute=0, second=0, microsecond=0).strftime("%Y-%m-%dT%H:%M")
+        # Suggest the earliest allowed time (20-minute minimum) plus a few minutes
+        # to confirm, rounded up to the next 5 minutes.
+        soon = datetime.now(ET) + MIN_LEAD + timedelta(minutes=5)
+        soon += timedelta(minutes=(5 - soon.minute % 5) % 5)
+        default_at = soon.replace(second=0, microsecond=0).strftime("%Y-%m-%dT%H:%M")
         content = f"""
         <section>
           <div class="ok">Sample sent to your phones. Check how it looks there.</div>
@@ -670,10 +673,8 @@ def register_admin(app):
         can_cancel = (status == "scheduled" and send_at
                       and send_at > datetime.now(timezone.utc) and counts.get("scheduled"))
         cancel_form = f"""
-          <form method="post" action="/admin/send/{send_id}/cancel"
-                onsubmit="return confirm('Cancel this send for everyone?')">
-            <button class="danger" type="submit">Cancel this send</button>
-          </form>""" if can_cancel else ""
+          <a class="button danger" href="/admin/send/{send_id}/cancel">Cancel this send</a>
+          """ if can_cancel else ""
         refresh_form = f"""
           <form method="post" action="/admin/send/{send_id}/refresh">
             <button class="secondary" type="submit">Re-check with Twilio</button>
@@ -701,6 +702,27 @@ def register_admin(app):
         </section>
         """
         return page(f"Send {send_id}", content, refresh=busy)
+
+    @app.route("/admin/send/<int:send_id>/cancel", methods=["GET"])
+    @admin_required
+    def admin_cancel_ask(send_id):
+        # An on-page question instead of a browser pop-up.
+        row = query("SELECT body, status, send_at, recipients FROM sends WHERE id = %s",
+                    (send_id,), one=True)
+        if not row or row[1] != "scheduled":
+            return redirect(f"/admin/send/{send_id}", 303)
+        body, _, send_at, recipients = row
+        return page("Cancel this send?", f"""
+        <section>
+          <h2>Cancel this send for everyone?</h2>
+          <p>It is scheduled for {escape(fmt_time(send_at))} to {recipients} people.
+             Nobody will receive it.</p>
+          <pre class="msg">{escape(body)}</pre>
+          <form method="post" action="/admin/send/{send_id}/cancel">
+            <button class="danger" type="submit">Yes, cancel it for everyone</button>
+          </form>
+          <a class="button secondary" href="/admin/send/{send_id}">No, keep it scheduled</a>
+        </section>""")
 
     @app.route("/admin/send/<int:send_id>/cancel", methods=["POST"])
     @admin_required
