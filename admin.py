@@ -11,22 +11,27 @@
 #
 # Environment variables (set in Railway):
 #   ADMIN_PASSWORD                 required; the admin page is off without it
-#   ADMIN_USER                     optional, default "admin"
+#   ADMIN_USER                     optional, default "admin" (the sign-in username)
+#
+# Sign-in uses a login page and a signed cookie that lasts 30 days; "Log out"
+# clears it. Changing ADMIN_PASSWORD signs every browser out.
 #   TWILIO_MESSAGING_SERVICE_SID   required for sending/scheduling (starts with MG)
 #   TESTERS_ONLY                   optional; "1" sends every run to testers only (for trials)
 
+import hashlib
 import hmac
 import math
 import os
 import threading
+import time
 from datetime import datetime, timedelta, timezone
 from html import escape
-from urllib.parse import urlparse
+from urllib.parse import quote, urlparse
 from zoneinfo import ZoneInfo
 
 import phonenumbers
 import psycopg2
-from flask import Response, redirect, request
+from flask import Response, redirect, request, session
 from phonenumbers import PhoneNumberFormat
 from twilio.base.exceptions import TwilioRestException
 from twilio.rest import Client
@@ -297,6 +302,12 @@ table{width:100%;border-collapse:collapse}td,th{text-align:left;padding:6px 4px;
 border-bottom:1px solid var(--line);vertical-align:top}th{font-weight:600}
 .big{font-size:1.6rem;font-weight:700}label{display:block;margin:8px 0}
 a{color:var(--accent)}
+header{display:flex;flex-wrap:wrap;align-items:center;justify-content:space-between;
+gap:8px;margin-bottom:8px}header h1{margin:8px 0}
+.account{display:flex;align-items:center;gap:10px;margin:0}
+.account button{margin-top:0;padding:6px 12px}
+input[type=email],input[type=password]{width:100%;font:inherit;color:inherit;
+background:var(--bg);border:1px solid var(--line);border-radius:8px;padding:10px}
 """
 
 COUNTER_JS = """
@@ -312,11 +323,16 @@ t.addEventListener('input',upd);upd();})();
 
 def page(title, content, refresh=False):
     meta = '<meta http-equiv="refresh" content="8">' if refresh else ""
+    account = ""
+    if session.get("admin"):
+        account = (f"<form method='post' action='/admin/logout' class='account'>"
+                   f"<span class='muted'>{escape(ADMIN_USER)}</span>"
+                   f"<button class='secondary' type='submit'>Log out</button></form>")
     html = (f"<!doctype html><html lang='en'><head><meta charset='utf-8'>"
             f"<meta name='viewport' content='width=device-width,initial-scale=1'>{meta}"
             f"<title>{escape(title)}</title><style>{CSS}</style></head>"
-            f"<body><main><h1><a href='/admin' style='color:inherit;text-decoration:none'>"
-            f"Misbah SMS</a></h1>{content}</main></body></html>")
+            f"<body><main><header><h1><a href='/admin' style='color:inherit;text-decoration:none'>"
+            f"Misbah SMS</a></h1>{account}</header>{content}</main></body></html>")
     return Response(html, mimetype="text/html")
 
 
@@ -334,25 +350,52 @@ def error_page(message, back="/admin"):
 # ----------------------------
 # AUTH
 # ----------------------------
+SESSION_DAYS = 30
+
+
+def same_site_post():
+    """Block forms posted from other websites (the browser sends the login cookie)."""
+    origin = request.headers.get("Origin") or request.headers.get("Referer") or ""
+    return urlparse(origin).netloc == request.host
+
+
+def safe_next(target):
+    """Only ever send people back to a page of this admin site."""
+    if target and target.startswith("/admin") and not target.startswith("//"):
+        return target
+    return "/admin"
+
+
 def admin_required(view):
     def wrapped(*args, **kwargs):
         if not ADMIN_PASSWORD:
             return Response("Admin page is off: set ADMIN_PASSWORD in Railway.", 503)
         if not MESSAGING_SERVICE_SID:
             return Response("Set TWILIO_MESSAGING_SERVICE_SID in Railway.", 503)
-        auth = request.authorization
-        if not (auth and hmac.compare_digest(auth.username or "", ADMIN_USER)
-                and hmac.compare_digest(auth.password or "", ADMIN_PASSWORD)):
-            return Response("Login required", 401,
-                            {"WWW-Authenticate": 'Basic realm="Misbah SMS admin"'})
-        if request.method == "POST":
-            # Block forms posted from other websites (the browser re-sends the login).
-            origin = request.headers.get("Origin") or request.headers.get("Referer") or ""
-            if urlparse(origin).netloc != request.host:
-                return Response("Forbidden", 403)
+        if not session.get("admin"):
+            target = request.full_path if request.method == "GET" else "/admin"
+            return redirect("/admin/login?next=" + quote(target.rstrip("?")), 303)
+        if request.method == "POST" and not same_site_post():
+            return Response("Forbidden", 403)
         return view(*args, **kwargs)
     wrapped.__name__ = view.__name__
     return wrapped
+
+
+def login_page(error="", next_url="/admin"):
+    note = f"<div class='note'>{escape(error)}</div>" if error else ""
+    return page("Sign in", f"""
+        <section>
+          <h2>Sign in</h2>{note}
+          <form method="post" action="/admin/login">
+            <input type="hidden" name="next" value="{escape(next_url)}">
+            <label>Username
+              <input type="email" name="username" autocomplete="username" required autofocus></label>
+            <label>Password
+              <input type="password" name="password" autocomplete="current-password" required></label>
+            <button type="submit">Sign in</button>
+          </form>
+        </section>""")
 
 
 # ----------------------------
@@ -360,6 +403,46 @@ def admin_required(view):
 # ----------------------------
 def register_admin(app):
     init_admin_db()
+
+    # Sign-in cookie. The signing key is derived from the password and the
+    # Twilio token, so changing ADMIN_PASSWORD signs everyone out.
+    if not app.secret_key:
+        app.secret_key = hashlib.sha256(
+            ("misbah-admin-session:" + ADMIN_PASSWORD + ":"
+             + os.environ["TWILIO_AUTH_TOKEN"]).encode()).hexdigest()
+    app.config.update(
+        SESSION_COOKIE_SECURE=True,
+        SESSION_COOKIE_HTTPONLY=True,
+        SESSION_COOKIE_SAMESITE="Lax",
+        PERMANENT_SESSION_LIFETIME=timedelta(days=SESSION_DAYS),
+    )
+
+    @app.route("/admin/login", methods=["GET", "POST"])
+    def admin_login():
+        if not ADMIN_PASSWORD:
+            return Response("Admin page is off: set ADMIN_PASSWORD in Railway.", 503)
+        next_url = safe_next(request.values.get("next"))
+        if request.method == "GET":
+            if session.get("admin"):
+                return redirect(next_url, 303)
+            return login_page(next_url=next_url)
+        if not same_site_post():
+            return Response("Forbidden", 403)
+        user_ok = hmac.compare_digest(
+            (request.form.get("username") or "").strip().lower(), ADMIN_USER.lower())
+        pass_ok = hmac.compare_digest(request.form.get("password") or "", ADMIN_PASSWORD)
+        if not (user_ok and pass_ok):
+            time.sleep(1)  # slow down password guessing
+            return login_page("Wrong username or password.", next_url)
+        session.clear()
+        session.permanent = True
+        session["admin"] = True
+        return redirect(next_url, 303)
+
+    @app.route("/admin/logout", methods=["POST"])
+    def admin_logout():
+        session.clear()
+        return redirect("/admin/login", 303)
 
     @app.route("/sms/status", methods=["POST"])
     def sms_status():
