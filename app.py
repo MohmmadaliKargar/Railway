@@ -492,5 +492,7 @@ init_db()
 # ADMIN PAGE (/admin) AND DELIVERY STATUS (/sms/status)
 # ----------------------------
 from admin import register_admin  # noqa: E402
+from connector import register_connector  # noqa: E402
 
 register_admin(app)
+register_connector(app)

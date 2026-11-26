@@ -360,8 +360,10 @@ def same_site_post():
 
 
 def safe_next(target):
-    """Only ever send people back to a page of this admin site."""
-    if target and target.startswith("/admin") and not target.startswith("//"):
+    """Only ever send people back to a page of this admin site (or the
+    connection-approval page Claude sends them to)."""
+    if target and not target.startswith("//") and (
+            target.startswith("/admin") or target.startswith("/oauth/authorize?")):
         return target
     return "/admin"
 
@@ -491,6 +493,22 @@ def register_admin(app):
         trial = ("<div class='note'>Trial mode (TESTERS_ONLY=1): every send goes to "
                  "testers only.</div>") if TESTERS_ONLY else ""
 
+        connections = query("""
+            SELECT c.client_id, c.client_name, c.created_at, c.last_used_at
+            FROM oauth_clients c
+            WHERE EXISTS (SELECT 1 FROM oauth_tokens t WHERE t.client_id = c.client_id
+                          AND t.kind = 'refresh' AND NOT t.revoked AND t.expires_at > now())
+            ORDER BY c.created_at DESC
+        """)
+        conn_rows = "".join(
+            f"<tr><td>{escape(name)}<br><span class='muted'>connected "
+            f"{escape(created.astimezone(ET).strftime('%b %d, %Y'))}"
+            f"{', last used ' + escape(used.astimezone(ET).strftime('%b %d, %I:%M %p ET')) if used else ''}"
+            f"</span></td><td><form method='post' action='/admin/connections/{escape(cid)}/disconnect'>"
+            f"<button class='secondary' type='submit'>Disconnect</button></form></td></tr>"
+            for cid, name, created, used in connections
+        ) or "<tr><td class='muted'>No Claude accounts connected.</td></tr>"
+
         content = f"""
         {trial}
         <section>
@@ -518,6 +536,10 @@ def register_admin(app):
               Text them a welcome message: <span class="muted">{escape(WELCOME_TEXT)}</span></label>
             <button type="submit" class="secondary">Add numbers</button>
           </form>
+        </section>
+        <section>
+          <h2>Connected Claude accounts</h2>
+          <table>{conn_rows}</table>
         </section>
         {COUNTER_JS}
         """
@@ -742,39 +764,52 @@ def register_admin(app):
     @app.route("/admin/subscribers/add", methods=["POST"])
     @admin_required
     def admin_add_numbers():
-        raw = (request.form.get("numbers") or "").replace(",", "\n").splitlines()
-        welcome = request.form.get("welcome") == "1"
-        lines = []
-        seen = set()
-        for item in (r.strip() for r in raw):
-            if not item:
-                continue
-            phone = to_e164(item)
-            if phone is None:
-                lines.append(f"⚠️ {escape(item)}: not a valid number, skipped")
-                continue
-            if phone in seen:
-                continue
-            seen.add(phone)
-            row = query("SELECT opted_in FROM subscribers WHERE phone_e164 = %s",
-                        (phone,), one=True)
-            if row and row[0]:
-                lines.append(f"✔️ {phone}: already subscribed")
-            elif row:
-                lines.append(f"🚫 {phone}: replied STOP earlier, NOT added "
-                             "(they can text JOIN or START themselves)")
-            else:
-                query("INSERT INTO subscribers (phone_e164, opted_in, source, updated_at) "
-                      "VALUES (%s, TRUE, 'admin_page', now()) ON CONFLICT DO NOTHING", (phone,))
-                text = f"✅ {phone}: added"
-                if welcome:
-                    try:
-                        client.messages.create(messaging_service_sid=MESSAGING_SERVICE_SID,
-                                               body=WELCOME_TEXT, to=phone)
-                        text += ", welcome sent"
-                    except TwilioRestException as e:
-                        text += f", welcome failed (Twilio error {e.code})"
-                lines.append(text)
-        items = "".join(f"<li>{line}</li>" for line in lines) or "<li>No numbers given.</li>"
+        lines = add_numbers(request.form.get("numbers") or "",
+                            welcome=request.form.get("welcome") == "1", source="admin_page")
+        items = "".join(f"<li>{escape(line)}</li>" for line in lines) or "<li>No numbers given.</li>"
         return page("Numbers added", f"<section><h2>Result</h2><ul>{items}</ul>"
                                      f"<a class='button secondary' href='/admin'>Back</a></section>")
+
+    @app.route("/admin/connections/<client_id>/disconnect", methods=["POST"])
+    @admin_required
+    def admin_disconnect(client_id):
+        query("UPDATE oauth_tokens SET revoked = TRUE WHERE client_id = %s", (client_id,))
+        return redirect("/admin", 303)
+
+
+def add_numbers(raw_text, welcome, source, dry_run=False):
+    """Add numbers people gave you. Returns one plain-text line per number.
+    Never re-adds someone who replied STOP."""
+    lines = []
+    seen = set()
+    for item in (r.strip() for r in raw_text.replace(",", "\n").splitlines()):
+        if not item:
+            continue
+        phone = to_e164(item)
+        if phone is None:
+            lines.append(f"⚠️ {item}: not a valid number, skipped")
+            continue
+        if phone in seen:
+            continue
+        seen.add(phone)
+        row = query("SELECT opted_in FROM subscribers WHERE phone_e164 = %s", (phone,), one=True)
+        if row and row[0]:
+            lines.append(f"✔️ {phone}: already subscribed")
+        elif row:
+            lines.append(f"🚫 {phone}: replied STOP earlier, NOT added "
+                         "(they can text JOIN or START themselves)")
+        elif dry_run:
+            lines.append(f"➕ {phone}: new, would be added")
+        else:
+            query("INSERT INTO subscribers (phone_e164, opted_in, source, updated_at) "
+                  "VALUES (%s, TRUE, %s, now()) ON CONFLICT DO NOTHING", (phone, source))
+            text = f"✅ {phone}: added"
+            if welcome:
+                try:
+                    client.messages.create(messaging_service_sid=MESSAGING_SERVICE_SID,
+                                           body=WELCOME_TEXT, to=phone)
+                    text += ", welcome sent"
+                except TwilioRestException as e:
+                    text += f", welcome failed (Twilio error {e.code})"
+            lines.append(text)
+    return lines
