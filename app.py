@@ -486,3 +486,11 @@ def inbound_sms():
 # INITIALIZE DATABASE
 # ----------------------------
 init_db()
+
+
+# ----------------------------
+# ADMIN PAGE (/admin) AND DELIVERY STATUS (/sms/status)
+# ----------------------------
+from admin import register_admin  # noqa: E402
+
+register_admin(app)
