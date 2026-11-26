@@ -320,6 +320,12 @@ def page(title, content, refresh=False):
     return Response(html, mimetype="text/html")
 
 
+def discard_form(draft_id):
+    return (f"<form method='post' action='/admin/draft/{draft_id}/discard' style='display:inline'"
+            f" onsubmit=\"return confirm('Cancel this message? Nothing will be sent.')\">"
+            f"<button class='secondary' type='submit'>Cancel, don't send</button></form>")
+
+
 def error_page(message, back="/admin"):
     return page("Problem", f"<section><div class='note'>{escape(message)}</div>"
                            f"<a class='button secondary' href='{back}'>Go back</a></section>")
@@ -387,7 +393,7 @@ def register_admin(app):
                    count(m.*) FILTER (WHERE m.status = 'delivered'),
                    left(s.body, 60)
             FROM sends s LEFT JOIN send_messages m ON m.send_id = s.id
-            WHERE s.status <> 'draft'
+            WHERE s.status NOT IN ('draft', 'discarded')
             GROUP BY s.id ORDER BY s.id DESC LIMIT 15
         """)
 
@@ -473,6 +479,7 @@ def register_admin(app):
           <pre class="msg">{escape(body)}</pre>
           <p class="muted">{len(body)} characters, {sms_parts(body)} SMS part(s) per person.</p>
           <a class="button secondary" href="/admin?draft={draft_id}">Change the text</a>
+          {discard_form(draft_id)}
         </section>
         <section>
           <h2>When should it go out?</h2>
@@ -520,9 +527,18 @@ def register_admin(app):
             <button type="submit">{'Send now' if send_at is None else 'Schedule'} to {count} people</button>
           </form>
           <a class="button secondary" href="/admin/draft/{draft_id}">Back</a>
+          {discard_form(draft_id)}
         </section>
         """
         return page("Confirm", content)
+
+    @app.route("/admin/draft/<int:draft_id>/discard", methods=["POST"])
+    @admin_required
+    def admin_discard(draft_id):
+        # Only a draft can be discarded; anything already sent or scheduled is untouched.
+        query("UPDATE sends SET status = 'discarded' WHERE id = %s AND status = 'draft'",
+              (draft_id,))
+        return redirect("/admin", 303)
 
     @app.route("/admin/draft/<int:draft_id>/confirm", methods=["POST"])
     @admin_required
