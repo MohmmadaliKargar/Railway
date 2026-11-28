@@ -349,6 +349,27 @@ def send_list_alert(phone_e164: str, title: str, keyword: str):
         print(f"[ERROR] Failed to send list alert: {exc}")
 
 
+def forward_to_admin(from_number: str, original_body: str):
+    try:
+
+        twilio_client.messages.create(
+            from_=TWILIO_FROM_NUMBER,
+            to=ADMIN_PHONE,
+            body=(
+                "New inbound SMS\n"
+                f"From: {from_number}\n"
+                f"Message: {original_body}"
+            ),
+        )
+
+    except Exception as exc:
+
+        # Don't break the webhook if admin alert fails
+        print(
+            f"[ERROR] Failed to alert admin: {exc}"
+        )
+
+
 def alert_admin_email(phone_e164: str, email: str):
     try:
         with get_conn() as conn:
@@ -538,11 +559,22 @@ def inbound_sms():
         # Invalid format
         else:
 
-            resp.message(
-                "That doesn’t appear to be a valid "
-                "email address.\n\n"
-                "Please check it and send it again."
-            )
+            # Not an email: it may be a question, so pass it on
+            forward_to_admin(from_number, original_body)
+
+            if "@" in body:
+                resp.message(
+                    "That doesn’t appear to be a valid "
+                    "email address.\n\n"
+                    "Please check it and send it again."
+                )
+            else:
+                resp.message(
+                    "Your message has been received. "
+                    "We will get back to you shortly.\n\n"
+                    "To join our FREE email list, please reply "
+                    "with a valid email address, or reply SKIP."
+                )
 
 
     # ------------------------
@@ -551,25 +583,7 @@ def inbound_sms():
     else:
 
         # Alert admin with incoming message
-        try:
-
-            twilio_client.messages.create(
-                from_=TWILIO_FROM_NUMBER,
-                to=ADMIN_PHONE,
-                body=(
-                    "New inbound SMS\n"
-                    f"From: {from_number}\n"
-                    f"Message: {original_body}"
-                ),
-            )
-
-        except Exception as exc:
-
-            # Don't break the webhook if admin alert fails
-            print(
-                f"[ERROR] Failed to alert admin: {exc}"
-            )
-
+        forward_to_admin(from_number, original_body)
 
         # Reply to sender
         resp.message(
