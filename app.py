@@ -73,6 +73,17 @@ def init_db():
                 ADD COLUMN IF NOT EXISTS awaiting_email_since TIMESTAMPTZ
             """)
 
+            # Messages forwarded to the admin; the id is the reply code
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS inbound_messages (
+                    id SERIAL PRIMARY KEY,
+                    phone_e164 TEXT NOT NULL,
+                    body TEXT,
+                    received_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                    replied_at TIMESTAMPTZ
+                )
+            """)
+
         conn.commit()
 
 
@@ -352,6 +363,25 @@ def send_list_alert(phone_e164: str, title: str, keyword: str):
 def forward_to_admin(from_number: str, original_body: str):
     try:
 
+        # Save it so the admin can answer with its code
+        code = None
+        try:
+            with get_conn() as conn:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        "INSERT INTO inbound_messages (phone_e164, body) "
+                        "VALUES (%s, %s) RETURNING id",
+                        (from_number, original_body)
+                    )
+                    code = cur.fetchone()[0]
+                conn.commit()
+        except Exception as exc:
+            print(f"[ERROR] Failed to save inbound message: {exc}")
+
+        reply_line = (
+            f"\n\nReply: #{code} your answer" if code else ""
+        )
+
         twilio_client.messages.create(
             from_=TWILIO_FROM_NUMBER,
             to=ADMIN_PHONE,
@@ -359,6 +389,7 @@ def forward_to_admin(from_number: str, original_body: str):
                 "New inbound SMS\n"
                 f"From: {from_number}\n"
                 f"Message: {original_body}"
+                f"{reply_line}"
             ),
         )
 
@@ -368,6 +399,70 @@ def forward_to_admin(from_number: str, original_body: str):
         print(
             f"[ERROR] Failed to alert admin: {exc}"
         )
+
+
+def is_admin_number(phone: str) -> bool:
+    digits = re.sub(r"\D", "", phone or "")
+    return bool(digits) and digits == re.sub(r"\D", "", ADMIN_PHONE)
+
+
+def relay_admin_reply(code: int, text: str) -> str:
+    """Send the admin's answer to whoever sent message #code.
+    Returns the confirmation to text back to the admin."""
+    text = text.strip()
+    if not text:
+        return (
+            f"❌ Nothing sent. Put your answer after the code, "
+            f"like: #{code} Thank you!"
+        )
+
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT phone_e164 FROM inbound_messages WHERE id = %s",
+                (code,)
+            )
+            row = cur.fetchone()
+
+    if not row:
+        return f"❌ Nothing sent. There is no message #{code}."
+
+    to_number = row[0]
+
+    if subscriber_status(to_number) is False:
+        return (
+            f"❌ Not sent to {to_number}: they replied STOP, "
+            "so texts to them are blocked."
+        )
+
+    try:
+        twilio_client.messages.create(
+            from_=TWILIO_FROM_NUMBER,
+            to=to_number,
+            body=text,
+        )
+    except Exception as exc:
+        if getattr(exc, "code", None) == 21610:
+            return (
+                f"❌ Not sent to {to_number}: they replied STOP, "
+                "so texts to them are blocked."
+            )
+        print(f"[ERROR] Failed to relay admin reply: {exc}")
+        return (
+            f"❌ Not sent to {to_number}. Twilio said: "
+            f"{getattr(exc, 'msg', None) or exc}"
+        )[:300]
+
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "UPDATE inbound_messages SET replied_at = NOW() "
+                "WHERE id = %s",
+                (code,)
+            )
+        conn.commit()
+
+    return f"✅ Sent to {to_number}"
 
 
 def alert_admin_email(phone_e164: str, email: str):
@@ -409,6 +504,23 @@ def inbound_sms():
     body_lower = body.lower()
 
     resp = MessagingResponse()
+
+
+    # ------------------------
+    # ADMIN REPLY: "#12 your answer" from the admin phone
+    # ------------------------
+    reply_match = re.match(r"#\s*(\d{1,9})\b\s*(.*)", body, re.S)
+
+    if reply_match and is_admin_number(from_number):
+
+        resp.message(
+            relay_admin_reply(
+                int(reply_match.group(1)),
+                reply_match.group(2)
+            )
+        )
+
+        return str(resp)
 
 
     # ------------------------
