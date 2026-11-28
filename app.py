@@ -308,6 +308,23 @@ def alert_admin_join(phone_e164: str, was_subscribed, keyword: str):
     if was_subscribed is True:
         return
 
+    if was_subscribed is None:
+        title = "🎉 New subscriber"
+    else:
+        title = "🔁 Subscribed again"
+
+    send_list_alert(phone_e164, title, keyword)
+
+
+def alert_admin_stop(phone_e164: str, was_subscribed, keyword: str):
+    # Only news if they were on the list
+    if was_subscribed is not True:
+        return
+
+    send_list_alert(phone_e164, "👋 Unsubscribed", keyword)
+
+
+def send_list_alert(phone_e164: str, title: str, keyword: str):
     try:
         with get_conn() as conn:
             with conn.cursor() as cur:
@@ -315,11 +332,6 @@ def alert_admin_join(phone_e164: str, was_subscribed, keyword: str):
                     "SELECT COUNT(*) FROM subscribers WHERE opted_in"
                 )
                 total = cur.fetchone()[0]
-
-        if was_subscribed is None:
-            title = "🎉 New subscriber"
-        else:
-            title = "🔁 Subscribed again"
 
         twilio_client.messages.create(
             from_=TWILIO_FROM_NUMBER,
@@ -334,7 +346,7 @@ def alert_admin_join(phone_e164: str, was_subscribed, keyword: str):
 
     except Exception as exc:
         # Never break the webhook over an alert
-        print(f"[ERROR] Failed to send join alert: {exc}")
+        print(f"[ERROR] Failed to send list alert: {exc}")
 
 
 # ----------------------------
@@ -392,10 +404,14 @@ def inbound_sms():
         "quit"
     ):
 
+        was_subscribed = subscriber_status(from_number)
+
         upsert_subscriber(
             from_number,
             False
         )
+
+        alert_admin_stop(from_number, was_subscribed, body_lower)
 
         set_awaiting_email(
             from_number,
