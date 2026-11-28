@@ -349,6 +349,32 @@ def send_list_alert(phone_e164: str, title: str, keyword: str):
         print(f"[ERROR] Failed to send list alert: {exc}")
 
 
+def alert_admin_email(phone_e164: str, email: str):
+    try:
+        with get_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT COUNT(*) FROM subscribers "
+                    "WHERE opted_in AND email IS NOT NULL"
+                )
+                total = cur.fetchone()[0]
+
+        twilio_client.messages.create(
+            from_=TWILIO_FROM_NUMBER,
+            to=ADMIN_PHONE,
+            body=(
+                "📧 Email received\n"
+                f"Phone: {phone_e164}\n"
+                f"Email: {email.strip().lower()}\n"
+                f"Subscribers with email: {total}"
+            ),
+        )
+
+    except Exception as exc:
+        # Never break the webhook over an alert
+        print(f"[ERROR] Failed to send list alert: {exc}")
+
+
 # ----------------------------
 # WEBHOOK
 # ----------------------------
@@ -493,6 +519,8 @@ def inbound_sms():
                 from_number,
                 body
             )
+
+            alert_admin_email(from_number, body)
 
             resp.message(
                 "Thank you! Your email address "
