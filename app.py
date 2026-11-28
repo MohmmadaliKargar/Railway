@@ -289,6 +289,55 @@ def validate_email(value: str):
 
 
 # ----------------------------
+# JOIN ALERTS
+# ----------------------------
+def subscriber_status(phone_e164: str):
+    """True = subscribed, False = opted out, None = not on the list."""
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT opted_in FROM subscribers WHERE phone_e164 = %s",
+                (phone_e164,)
+            )
+            row = cur.fetchone()
+    return None if row is None else row[0]
+
+
+def alert_admin_join(phone_e164: str, was_subscribed, keyword: str):
+    # Someone already subscribed sending JOIN again is not news
+    if was_subscribed is True:
+        return
+
+    try:
+        with get_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT COUNT(*) FROM subscribers WHERE opted_in"
+                )
+                total = cur.fetchone()[0]
+
+        if was_subscribed is None:
+            title = "🎉 New subscriber"
+        else:
+            title = "🔁 Subscribed again"
+
+        twilio_client.messages.create(
+            from_=TWILIO_FROM_NUMBER,
+            to=ADMIN_PHONE,
+            body=(
+                f"{title}\n"
+                f"Phone: {phone_e164}\n"
+                f"Texted: {keyword.upper()}\n"
+                f"Subscribers now: {total}"
+            ),
+        )
+
+    except Exception as exc:
+        # Never break the webhook over an alert
+        print(f"[ERROR] Failed to send join alert: {exc}")
+
+
+# ----------------------------
 # WEBHOOK
 # ----------------------------
 @app.route("/sms/inbound", methods=["POST"])
@@ -308,11 +357,15 @@ def inbound_sms():
     # ------------------------
     if body_lower == "join":
 
+        was_subscribed = subscriber_status(from_number)
+
         # Subscribe them immediately
         upsert_subscriber(
             from_number,
             True
         )
+
+        alert_admin_join(from_number, was_subscribed, body_lower)
 
         # Start the 24-hour email collection window
         set_awaiting_email(
@@ -360,10 +413,14 @@ def inbound_sms():
     # ------------------------
     elif body_lower == "start":
 
+        was_subscribed = subscriber_status(from_number)
+
         upsert_subscriber(
             from_number,
             True
         )
+
+        alert_admin_join(from_number, was_subscribed, body_lower)
 
         set_awaiting_email(
             from_number,
